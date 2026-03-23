@@ -46,7 +46,7 @@ def get_fft_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, load
 def get_hira_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, load_bit=16,
                     r_ab=16, target_modules=None, init_a='kaiming',
                     init_b='zero', train_ab='yy',
-                    rand_R=False):
+                    rand_R=False, lora_type='hira', n=2):
     load_params = {}
     if load_bit == 16:
         load_params = {'torch_dtype': torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16}
@@ -92,6 +92,8 @@ def get_hira_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, loa
         init_b=init_b,
         train_a=_train_ab[0],
         train_b=_train_ab[1],
+        lora_type=lora_type,
+        n=n,
     )
 
     model = get_peft_model(model, config)

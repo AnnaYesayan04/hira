@@ -59,6 +59,8 @@ class LoraConfig(PeftConfig):
         modules_to_save (`List[str]`):List of modules apart from LoRA layers to be set as trainable
             and saved in the final checkpoint.
     """
+    lora_type: str = field(default='hira', metadata={"help": "Which layer type: 'hira' or 'recursive'"})
+    n: int = field(default=2, metadata={"help": "Recursive lora power"})
     init_a: str = field(default='kaiming')
     init_b: str = field(default='zero')
     rand_R: bool = field(default=False)
@@ -157,6 +159,7 @@ class LoraModel(torch.nn.Module):
             "train_a": lora_config.train_a,
             "train_b": lora_config.train_b,
             "rand_R": lora_config.rand_R,
+            "n": lora_config.n,
         }
         key_list = [key for key, _ in self.model.named_modules()]
         for key in key_list:
@@ -219,7 +222,11 @@ class LoraModel(torch.nn.Module):
                                 f"Target module {target} is not supported. "
                                 f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                             )
-                        new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+                        
+                        if lora_config.lora_type == 'recursive':
+                            new_module = RecursiveLinear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+                        else:
+                            new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
 
                     self._replace_module(parent, target_name, new_module, target)
         if not is_target_modules_in_base_model:
@@ -476,7 +483,7 @@ class LoraLayer:
                 init_mapping[init_b](self.lora_B[adapter_name], **init_kwargs[init_b])
                 # AB prod
                 _prod_AB = torch.mm(self.lora_A[adapter_name].data.T, self.lora_B[adapter_name].data.T)
-                assert _prod_AB.mean().item() == 0
+                # assert _prod_AB.mean().item() == 0
         if adapter_name in self.lora_embedding_A.keys():
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.ones_(self.lora_embedding_A[adapter_name])
@@ -563,6 +570,90 @@ class Linear(nn.Linear, LoraLayer):
                                      bias=self.bias)
                 result = ab_result
         elif result is None:
+            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+        result = result.to(previous_dtype)
+
+        return result
+
+
+class RecursiveLinear(nn.Linear, LoraLayer):
+    # Lora implemented in a dense layer
+    def __init__(
+            self,
+            adapter_name: str,
+            in_features: int,
+            out_features: int,
+            r_ab: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            fan_in_fan_out: bool = False,
+            # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+            scale_ab: float = 1.0,
+            init_a: str = 'zero',
+            init_b: str = 'zero',
+            train_a: bool = True,
+            train_b: bool = True,
+            rand_R: bool = False,
+            n: int = 2,
+            **kwargs,
+    ):
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+        # Freezing the pre-trained weight matrix
+        self.weight.requires_grad = False
+        self.train_a = train_a
+        self.train_b = train_b
+        self.rand_R = rand_R
+        self.fan_in_fan_out = fan_in_fan_out
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+        nn.Linear.reset_parameters(self)
+        self.update_layer(adapter_name, r_ab, lora_alpha, lora_dropout, init_lora_weights, scale_ab,
+                          init_a, init_b, rand_R)
+        self.active_adapter = adapter_name
+        self.n = n
+
+    def merge(self):
+        raise NotImplementedError(' need reimplementation!')
+
+    def unmerge(self):
+        if self.active_adapter not in self.lora_A.keys():
+            return
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        if self.r[self.active_adapter] > 0:
+            self.weight.data -= (
+                    transpose(
+                        self.lora_B[self.active_adapter] @ self.lora_A[self.active_adapter],
+                        self.fan_in_fan_out,
+                    )
+                    * self.scaling[self.active_adapter]
+            )
+            self.merged = False
+
+    def forward(self, x: torch.Tensor):
+        previous_dtype = x.dtype
+        result = None
+
+        # result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        A = self.lora_A[self.active_adapter].T
+        B = self.lora_B[self.active_adapter].T
+        _prod_A = A.T @ A # [r, r]
+        _prod_B = B @ B.T # [r, r]
+        _prod_AB_squared = _prod_B @ _prod_A # [r, r]
+        _prod_AB_squared = torch.matrix_power(_prod_AB_squared, self.n)
+
+        x = x.to(self.lora_A[self.active_adapter].dtype)
+        _prod_AB = torch.mm(A, _prod_AB_squared)
+        _prod_AB = torch.mm(_prod_AB, B)
+        ab_result = F.linear(x, transpose(self.weight, self.fan_in_fan_out) + _prod_AB.T,
+                                bias=self.bias)
+        result = ab_result
+        if result is None:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
         result = result.to(previous_dtype)

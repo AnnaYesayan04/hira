@@ -24,6 +24,9 @@ from customized_trainer import customized_trainer
 parser = argparse.ArgumentParser()
 parser.add_argument('--peft_type', type=str,
                     choices=['prefix', 'hira', 'fft'])
+parser.add_argument('--lora_type', type=str,
+                    choices=['recursive', 'hira'], default='hira')
+parser.add_argument('--recursive_n', type=int, default=2)
 parser.add_argument('--enable_grad_ckpt', action='store_true')
 parser.add_argument('--batch', type=int, default=32)
 parser.add_argument('--grad_acc', type=int, default=1)
@@ -165,8 +168,8 @@ if peft_type == 'hira':
     model, tokenizer, model_config = get_hira_models(load_bit=args.load_bit,
                                                      model_name=model_name, enable_checkpoint=args.enable_grad_ckpt,
                                                      r_ab=args.r_ab,target_modules=args.target_modules,
-                                                     train_ab=args.train_ab,
-                                                     rand_R=args.rand_R)
+                                                     train_ab=args.train_ab, init_a=init_a, init_b=init_b,
+                                                     rand_R=args.rand_R, lora_type=args.lora_type, n=args.recursive_n)
 elif peft_type == 'fft':
     model, tokenizer, model_config = get_fft_models(load_bit=args.load_bit,
                                                     model_name=model_name, enable_checkpoint=args.enable_grad_ckpt)
@@ -296,6 +299,7 @@ trainer_args = transformers.Seq2SeqTrainingArguments(
 )
 trainer = customized_trainer.Seq2SeqTrainer(
     model=model,
+    tokenizer=tokenizer,
     train_dataset=train_dataset,
     eval_dataset=valid_dataset,
     callbacks=callbacks,
