@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 load_dotenv('.env')
 
-eval_folder_path = '<fill your result dir here>'
+eval_folder_path = 'frob_norm_instruct/Qwen2.5-0.5B-Instruct-gsm8k-hira-lr=1.00e-04-r_ab=32-init=kz-train=yy-seed=36--2026-04-13-15-13-38'
 
 import json
 import re
