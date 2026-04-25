@@ -61,6 +61,12 @@ class LoraConfig(PeftConfig):
     """
     lora_type: str = field(default='hira', metadata={"help": "Which layer type: 'hira' or 'recursive'"})
     n: int = field(default=2, metadata={"help": "Recursive lora power"})
+    ae_init_scale: float = field(
+        default=1e-4,
+        metadata={"help": "Initial per-channel scale (LayerScale) for the AE-OuterLN residual. "
+                          "Smaller values damp early-training gradients more aggressively. "
+                          "Only used by lora_type='ae_outer_ln'."},
+    )
     init_a: str = field(default='kaiming')
     init_b: str = field(default='zero')
     rand_R: bool = field(default=False)
@@ -160,6 +166,7 @@ class LoraModel(torch.nn.Module):
             "train_b": lora_config.train_b,
             "rand_R": lora_config.rand_R,
             "n": lora_config.n,
+            "ae_init_scale": lora_config.ae_init_scale,
         }
         key_list = [key for key, _ in self.model.named_modules()]
         for key in key_list:
@@ -225,6 +232,8 @@ class LoraModel(torch.nn.Module):
                         
                         if lora_config.lora_type == 'recursive':
                             new_module = RecursiveLinearFroNorm(adapter_name, in_features, out_features, bias=bias, **kwargs)
+                        elif lora_config.lora_type == 'ae_outer_ln':
+                            new_module = AutoencoderOuterLNLinear(adapter_name, in_features, out_features, bias=bias, **kwargs)
                         else:
                             new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
 
@@ -416,6 +425,12 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", config: Lo
             for n, p in model.named_parameters():
                 if "lora_B" in n:
                     p.requires_grad = True
+        # AutoencoderOuterLN extras (LayerNorm gamma/beta and the LayerScale
+        # per-channel gate) are always trained when present; they are part of
+        # the adapter and there is no meaningful "freeze them" mode.
+        for n, p in model.named_parameters():
+            if "lora_outer_ln_" in n or "lora_outer_scale" in n:
+                p.requires_grad = True
 
 
 class LoraLayer:
@@ -512,6 +527,7 @@ class Linear(nn.Linear, LoraLayer):
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
         kwargs.pop("n", None)
+        kwargs.pop("ae_init_scale", None)
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
@@ -600,6 +616,7 @@ class RecursiveLinear(nn.Linear, LoraLayer):
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        kwargs.pop("ae_init_scale", None)
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
@@ -684,6 +701,7 @@ class RecursiveLinearFroNorm(nn.Linear, LoraLayer):
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        kwargs.pop("ae_init_scale", None)
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
@@ -772,6 +790,7 @@ class ReluLayerNormLinear(nn.Linear, LoraLayer):
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        kwargs.pop("ae_init_scale", None)
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
@@ -866,6 +885,7 @@ class SimpleLinearLora(nn.Linear, LoraLayer):
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
+        kwargs.pop("ae_init_scale", None)
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
@@ -926,3 +946,122 @@ class SimpleLinearLora(nn.Linear, LoraLayer):
         result = result.to(previous_dtype)
 
         return result
+
+
+class AutoencoderOuterLNLinear(nn.Linear, LoraLayer):
+    """Autoencoder-style residual adapter with LayerNorm AFTER the up-projection.
+
+        y = W x + b  +  LN_out( B · σ(A x) )
+
+    A in [r, in], B in [out, r], σ = ReLU. LN_out has affine parameters
+    (gamma, beta) of dimension out_features, init to (1, 0). With ``init_b='zero'``
+    the residual is exactly zero at step 0, so the pretrained forward pass is
+    preserved at initialisation.
+
+    Distinction from the standard Houlsby adapter: LayerNorm is applied in the
+    OUTPUT space (out_features), AFTER the rank-r bottleneck and the activation,
+    not inside the bottleneck. The motivation (advisor) is that pre-LN
+    transformers feed already-normalised x into W; the adapter residual should
+    inherit the same per-token normalisation in W's output space rather than
+    imposing a separate normalisation inside the rank-r bottleneck.
+
+    Notes:
+      * The residual is non-linear in x, so this layer cannot be merged into W
+        at inference time. ``merge`` raises; ``unmerge`` is a no-op.
+      * Gamma / beta of LN_out are stored as ``lora_outer_ln_gamma`` and
+        ``lora_outer_ln_beta`` ParameterDicts so that the existing PEFT 0.3
+        save/load mechanism (which keys ``lora_*`` ParameterDicts by adapter
+        name) handles them without modification.
+      * ``mark_only_lora_as_trainable`` is patched to keep gamma / beta
+        trainable regardless of ``train_a`` / ``train_b``.
+    """
+
+    def __init__(
+            self,
+            adapter_name: str,
+            in_features: int,
+            out_features: int,
+            r_ab: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            fan_in_fan_out: bool = False,
+            scale_ab: float = 1.0,
+            init_a: str = 'kaiming',
+            init_b: str = 'zero',
+            train_a: bool = True,
+            train_b: bool = True,
+            rand_R: bool = False,
+            n: int = 2,                                 # unused; kept for API compatibility
+            ae_init_scale: float = 1e-4,
+            **kwargs,
+    ):
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
+        kwargs.pop("n", None)
+        kwargs.pop("ae_init_scale", None)
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+        self.weight.requires_grad = False
+        self.train_a = train_a
+        self.train_b = train_b
+        self.rand_R = rand_R
+        self.fan_in_fan_out = fan_in_fan_out
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+        nn.Linear.reset_parameters(self)
+        self.update_layer(adapter_name, r_ab, lora_alpha, lora_dropout, init_lora_weights,
+                          scale_ab, init_a, init_b, rand_R)
+        self.active_adapter = adapter_name
+
+        self.lora_outer_ln_gamma = nn.ParameterDict(
+            {adapter_name: nn.Parameter(torch.ones(out_features))}
+        )
+        self.lora_outer_ln_beta = nn.ParameterDict(
+            {adapter_name: nn.Parameter(torch.zeros(out_features))}
+        )
+        self.lora_outer_ln_eps = 1e-5
+
+        # LayerScale: per-channel learnable scalar that gates the residual.
+        # Initialized to a small value (default 1e-4) so the residual contribution
+        # is ~0 at start of training, regardless of LN's gradient amplification.
+        # As training proceeds the scalar grows where it's beneficial, layer-by-layer.
+        # Reference: Touvron et al., "Going deeper with image transformers", 2021.
+        self.ae_init_scale = float(ae_init_scale)
+        self.lora_outer_scale = nn.ParameterDict(
+            {adapter_name: nn.Parameter(torch.full((out_features,), float(ae_init_scale)))}
+        )
+
+    def merge(self):
+        raise NotImplementedError(
+            "AutoencoderOuterLNLinear cannot be merged into W (non-linear residual)."
+        )
+
+    def unmerge(self):
+        return
+
+    def forward(self, x: torch.Tensor):
+        previous_dtype = x.dtype
+
+        result = F.linear(
+            x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias
+        )
+
+        if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
+            return result
+
+        adapter = self.active_adapter
+        lora_dtype = self.lora_A[adapter].dtype
+        x_f = x.to(lora_dtype)
+
+        h = F.relu(F.linear(x_f, self.lora_A[adapter]))                  # [*, r]
+        z = F.linear(h, self.lora_B[adapter])                            # [*, out]
+        z = F.layer_norm(
+            z,
+            normalized_shape=(z.shape[-1],),
+            weight=self.lora_outer_ln_gamma[adapter],
+            bias=self.lora_outer_ln_beta[adapter],
+            eps=self.lora_outer_ln_eps,
+        )
+        z = z * self.lora_outer_scale[adapter]                           # LayerScale gate
+
+        return result + z.to(previous_dtype)
