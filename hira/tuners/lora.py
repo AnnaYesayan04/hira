@@ -991,13 +991,14 @@ class AutoencoderOuterLNLinear(nn.Linear, LoraLayer):
             train_a: bool = True,
             train_b: bool = True,
             rand_R: bool = False,
-            n: int = 2,                                 # unused; kept for API compatibility
+            n: int = 2,                                 # depth of bottleneck recursion
             ae_init_scale: float = 1e-4,
             **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
         kwargs.pop("n", None)
         kwargs.pop("ae_init_scale", None)
+
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         self.weight.requires_grad = False
@@ -1031,6 +1032,16 @@ class AutoencoderOuterLNLinear(nn.Linear, LoraLayer):
             {adapter_name: nn.Parameter(torch.full((out_features,), float(ae_init_scale)))}
         )
 
+        # Bottleneck recurrence: a learnable r x r matrix applied (n-1) times
+        # between encode and decode. Identity init makes the recursion a
+        # pass-through at step 0, so the residual remains ~0 thanks to
+        # ``lora_outer_scale = ae_init_scale``. Works for any (in, out) shape
+        # because all iterations live in the rank-r bottleneck.
+        self.n_recurrence = int(n)
+        self.lora_M = nn.ParameterDict(
+            {adapter_name: nn.Parameter(torch.eye(r_ab))}
+        )
+
     def merge(self):
         raise NotImplementedError(
             "AutoencoderOuterLNLinear cannot be merged into W (non-linear residual)."
@@ -1054,6 +1065,8 @@ class AutoencoderOuterLNLinear(nn.Linear, LoraLayer):
         x_f = x.to(lora_dtype)
 
         h = F.relu(F.linear(x_f, self.lora_A[adapter]))                  # [*, r]
+        for _ in range(self.n_recurrence - 1):
+            h = F.relu(F.linear(h, self.lora_M[adapter]))                # [*, r]
         z = F.linear(h, self.lora_B[adapter])                            # [*, out]
         z = F.layer_norm(
             z,
